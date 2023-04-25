@@ -699,24 +699,9 @@ class MBartEncoder(MBartPreTrainedModel):
         self.encoder_prompt_len = encoder_prompt_len ##prompt
         self.args = args
         #self.encoder_prompt_embedding = nn.Embedding(num_embeddings=encoder_prompt_len, embedding_dim= 800,padding_idx=self.padding_idx)
-        #self.prompt_linear_map = nn.Linear(800,embed_dim)
-        if args.prompt_lang_specific == "None":
-            self.prompt_layer_matrix = nn.Parameter(torch.randn(config.encoder_layers+1,encoder_prompt_len,800))
-            self.prompt_layer_linear = nn.ModuleList([nn.Linear(800,embed_dim) for i in range(config.encoder_layers+1)])
-        elif args.prompt_lang_specific == "horizon":
-            self.shared_layer_num = int((config.encoder_layers+1)*0.7)
-            self.specific_layer_num = config.encoder_layers + 1 - self.shared_layer_num
-            self.prompt_layer_matrix_shared = nn.Parameter(torch.randn(self.shared_layer_num,encoder_prompt_len,800))
-            self.prompt_layer_linear_shared = nn.ModuleList([nn.Linear(800,embed_dim) for i in range(self.shared_layer_num)])
-            self.prompt_layer_matrix_specific = nn.Parameter(torch.randn(5,self.shared_layer_num,encoder_prompt_len,800)) ##5 is the number of languages
-            self.prompt_layer_linear_specific = nn.ModuleList([nn.Linear(800,embed_dim) for i in range(self.shared_layer_num*5)])
-        elif args.prompt_lang_specific == "vertical":
-            self.shared_token_num = int(encoder_prompt_len*0.9)
-            self.specific_token_num = encoder_prompt_len - self.shared_token_num
-            self.prompt_layer_matrix_shared = nn.Parameter(torch.randn(config.encoder_layers+1,self.shared_token_num,800))
-            self.prompt_layer_linear = nn.ModuleList([nn.Linear(800,embed_dim) for i in range(self.config.encoder_layers+1)])
-            self.prompt_layer_matrix_specific = nn.Parameter(torch.randn(5, config.encoder_layers+1, self.specific_token_num, 800))
-
+        self.prompt_layer_matrix = nn.Parameter(torch.randn(config.encoder_layers+1,encoder_prompt_len,400))
+        self.prompt_layer_linear = nn.ModuleList([nn.Linear(400,embed_dim) for i in range(config.encoder_layers+1)])
+        
 
         self.dropout = config.dropout
         self.layerdrop = config.encoder_layerdrop
@@ -757,6 +742,7 @@ class MBartEncoder(MBartPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         lang = None,
+        prompt = None
     ) -> Union[Tuple, BaseModelOutput]:
         r"""
         Args:
@@ -814,30 +800,14 @@ class MBartEncoder(MBartPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
-            if self.args.prompt_lang_specific == "None":
+            if prompt == None:
                 prompt_embeds = self.prompt_layer_matrix[0]
                 prompt_embeds = self.prompt_layer_linear[0](prompt_embeds)
                 prompt_embeds = prompt_embeds.unsqueeze(0).repeat(input_ids.shape[0],1,1)
-            elif self.args.prompt_lang_specific == "horizon":
-                prompt_embeds = self.prompt_layer_matrix_shared[0]
-                prompt_embeds = self.prompt_layer_linear_shared[0](prompt_embeds)
-                prompt_embeds = prompt_embeds.unsqueeze(0).repeat(input_ids.shape[0],1,1)
-            elif self.args.prompt_lang_specific == "vertical":
-                prompt_embeds_list = []
-                for j in range(input_ids.shape[0]): ## a batch
-                    lang_id = lang[j].item()
-                    prompt_embeds_list.append(self.prompt_layer_linear[0](self.prompt_layer_matrix_specific[lang_id][0]))
-                    
-                prompt_embeds_specific = torch.stack(prompt_embeds_list)
-
-                prompt_embeds_shared = self.prompt_layer_matrix_shared[0]
-                prompt_embeds_shared = self.prompt_layer_linear[0](prompt_embeds_shared)
-                prompt_embeds_shared = prompt_embeds_shared.unsqueeze(0).repeat(input_ids.shape[0],1,1)
-                prompt_embeds = torch.cat((prompt_embeds_shared[:,:self.shared_token_num//2,:],prompt_embeds_specific,prompt_embeds_shared[:,self.shared_token_num//2:,:]),dim = 1)
-                
-
             else:
-                print("error!")
+                prompt_embeds = prompt
+                prompt_embeds = self.prompt_layer_linear[0](prompt_embeds)
+
         embed_pos = self.embed_positions(input)
 
         hidden_states = inputs_embeds + embed_pos
@@ -892,45 +862,20 @@ class MBartEncoder(MBartPreTrainedModel):
 
 
                 hidden_states = layer_outputs[0]
+                '''
+                
                 hidden_states_real = hidden_states[:,self.encoder_prompt_len:,:]
-                if self.args.prompt_lang_specific == "None": ### The prompt parameters are the same for samples in a batch
+                if prompt == None:
                     hidden_states_prompt = self.prompt_layer_matrix[idx]
                     hidden_states_prompt = self.prompt_layer_linear[idx](hidden_states_prompt)
                     hidden_states_prompt = hidden_states_prompt.unsqueeze(0)#.repeat(16,1)
                     hidden_states_prompt = hidden_states_prompt.repeat(hidden_states.shape[0],1,1)
-                elif self.args.prompt_lang_specific == "horizon":
-                    if idx < self.shared_layer_num: ## shared prompt parameter
-                        hidden_states_prompt = self.prompt_layer_matrix_shared[idx]
-                        hidden_states_prompt = self.prompt_layer_linear_shared[idx](hidden_states_prompt)
-                        hidden_states_prompt = hidden_states_prompt.unsqueeze(0)#.repeat(16,1)
-                        hidden_states_prompt = hidden_states_prompt.repeat(hidden_states.shape[0],1,1)
-                    else: ### prompt parameter are different for each sample in a batch
-                        hidden_states_prompt_list = []
-                        for j in range(hidden_states.shape[0]): ## a batch
-                            lang_id = lang[j].item()
-                            hidden_states_prompt = self.prompt_layer_matrix_specific[lang_id][idx-self.shared_layer_num]
-                            hidden_states_prompt = self.prompt_layer_linear_specific[(idx-self.shared_layer_num)*5+lang_id](hidden_states_prompt)
-                            hidden_states_prompt_list.append(hidden_states_prompt)
-                        hidden_states_prompt = torch.stack(hidden_states_prompt_list,dim = 0)
-                elif self.args.prompt_lang_specific == "vertical":
-                    hidden_states_prompt_list = []
-                    for j in range(input_ids.shape[0]): ## a batch
-                        lang_id = lang[j].item()
-                        hidden_states_prompt_list.append(self.prompt_layer_linear[idx](self.prompt_layer_matrix_specific[lang_id][idx]))
-                    
-                    hidden_states_prompt_specific = torch.stack(hidden_states_prompt_list)
-
-                    hidden_states_prompt_shared = self.prompt_layer_matrix_shared[idx]
-                    hidden_states_prompt_shared = self.prompt_layer_linear[idx](hidden_states_prompt_shared)
-                    hidden_states_prompt_shared = hidden_states_prompt_shared.unsqueeze(0).repeat(input_ids.shape[0],1,1)
-                    hidden_states_prompt = torch.cat((hidden_states_prompt_specific,hidden_states_prompt_shared),dim = 1)
-
-
                 else:
-                    print("error")
-                    exit()
+                    hidden_states_prompt = prompt[:,:,idx,:]
+                    hidden_states_prompt = self.prompt_layer_linear[idx](hidden_states_prompt)
+                
                 hidden_states = torch.cat((hidden_states_prompt,hidden_states_real),dim = 1)
-
+                '''
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
@@ -1284,6 +1229,7 @@ class MBartModel(MBartPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         lang = None,
+        prompt = None,
     ) -> Union[Seq2SeqModelOutput, Tuple[torch.FloatTensor]]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1306,7 +1252,8 @@ class MBartModel(MBartPreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                lang = lang
+                lang = lang,
+                prompt = prompt,
             )
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):

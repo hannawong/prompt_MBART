@@ -1,3 +1,4 @@
-data/*
-outputs/*
-text2text/*
+MultiATIS_data/
+STIL_data/
+Xpersona_data/
+nohup.out

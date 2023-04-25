@@ -1,8 +1,10 @@
 from transformer.src.transformers.models.mbart import MBartPreTrainedModel, MBartConfig, MBartModel
+from transformers import AutoModelForMaskedLM
+from transformer.src.transformers.models.bert import BertModel
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
-ENCODER_PROMPT_LEN = 100 ###lang: 10, intent:15
+ENCODER_PROMPT_LEN = 10 ###lang: 10, intent:15
 DECODER_PROMPT_LEN = 5
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int):
@@ -23,6 +25,73 @@ def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int):
     prev_output_tokens[:, 0] = decoder_start_tokens
 
     return prev_output_tokens
+
+
+class MBartDictionGeneration(nn.Module):
+    def __init__(self,config,args) -> None:
+        super().__init__()
+        self.diction_bert_model = BertModel.from_pretrained("bert-base-uncased")
+        self.bart_model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-cc25",config = config, args = args)
+        self.config = config
+        self.args = args
+        self.dic_dim = 10
+        self.attn_head_num = 10
+        self.diction_attn_linear_layer = nn.Linear(768, 256)
+        self.diction_attn_linear_layer1 = nn.Linear(256, self.attn_head_num * self.dic_dim)
+        self.dictionary = nn.Parameter(torch.randn(self.dic_dim,400))
+        self.encoder_layers = config.encoder_layers
+        self.sigmoid = nn.Sigmoid()
+
+
+    def forward(self,
+        input_ids: torch.LongTensor = None,
+        attention_mask = None,
+        decoder_input_ids = None,
+        decoder_attention_mask = None,
+        head_mask = None,
+        decoder_head_mask = None,
+        cross_attn_head_mask = None,
+        encoder_outputs = None,
+        past_key_values = None,
+        inputs_embeds = None,
+        decoder_inputs_embeds = None,
+        labels = None,
+        use_cache = None,
+        output_attentions = None,
+        output_hidden_states = None,
+        return_dict = None,
+        decoder_len = None, ### the prefix len of decoder
+        lang = None,
+        input_ids_bert = None):
+
+
+        dictionary_normed = torch.nn.functional.normalize(self.dictionary,p=2,dim=1)
+        bert_cls_last_hidden_state = self.diction_bert_model(input_ids_bert)[0][:,0,:] ##[bz,768]
+        bert_attention_score = self.diction_attn_linear_layer(bert_cls_last_hidden_state)##[bz, attn_head_num * dic_dim]
+        bert_attention_score = torch.nn.functional.relu(bert_attention_score)
+        bert_attention_score = self.diction_attn_linear_layer1(bert_attention_score)
+
+        bert_attention_score = bert_attention_score.reshape((bert_attention_score.shape[0],self.attn_head_num,self.dic_dim))
+        softmax = nn.Softmax(dim = 2)
+        bert_attention_score = softmax(bert_attention_score) ##[bz,attn_head_num, dic_dim]
+        prompt = torch.bmm(bert_attention_score,dictionary_normed.repeat(bert_attention_score.shape[0],1,1)) ##[bz,attn_head_num,800*layer_num]
+        prompt = prompt.reshape((prompt.shape[0],self.attn_head_num,400)) ##[bz,attn_head_num,layer_num,800]
+        ########### prompt generated!! #############
+        loss,lm_logits = self.bart_model(input_ids = input_ids, attention_mask = attention_mask, decoder_input_ids = decoder_input_ids, decoder_attention_mask = decoder_attention_mask,decoder_len = decoder_len, lang = lang, prompt = prompt)
+        orth_loss = torch.norm(torch.matmul(dictionary_normed.T,dictionary_normed))
+        theta0 = 0.5
+        theta1 = -1
+        sparse_loss = torch.norm(torch.sigmoid(theta0*bert_attention_score+theta1),1)
+
+        loss = loss + 0.005 * orth_loss + 0.0005*sparse_loss
+        
+        
+        
+        return loss,lm_logits
+
+        
+
+
 
 class MBartForConditionalGeneration(MBartPreTrainedModel):
     
@@ -79,7 +148,8 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         output_hidden_states = None,
         return_dict = None,
         decoder_len = None, ### the prefix len of decoder
-        lang = None
+        lang = None,
+        prompt = None
 
     ):
         r"""
@@ -109,7 +179,8 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            lang = lang
+            lang = lang,
+            prompt = prompt
             
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
@@ -117,17 +188,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         shift_logits = lm_logits[..., :-1, :].contiguous()  ##[16, 99]
         shift_labels = decoder_input_ids[..., 1:].contiguous() ##[16, 99, 250027]
         loss_fct = CrossEntropyLoss()
-        '''
-        shift_logits_prefix = [shift_logits[:i:decoder_len[i]] for i in range(decoder_len.shape[0])]
-        shift_labels_prefix =  [shift_labels[:i:decoder_len[i]] for i in range(decoder_len.shape[0])]
-        
-        #shift_logits_prefix = torch.stack(shift_logits_prefix)
-        #print(shift_logits_prefix.shape)
-        #exit()
-        loss_prefix = [loss_fct(shift_logits_prefix[i].unsqueeze(0).view(-1,shift_logits_prefix[i].size(-1)),shift_labels_prefix[i].unsqueeze(0).view(-1)) for i in range(decoder_len.shape[0])]
-        print(loss_prefix)
-        exit()
-        '''
+
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
         return loss,lm_logits
